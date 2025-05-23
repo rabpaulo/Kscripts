@@ -1,0 +1,185 @@
+#!/bin/sh
+
+# Dependencies:
+#    • curl
+#    • aria2c
+
+help() {
+cat <<EOF
+Usage: heyedl [options] <idol name> [group name]
+Options:
+  -d <directory>  Set output directory (default: heyedl)
+  -s <section>    Section to scrape (ex: idol, kgirls, hawk1, uesrup)
+  -u              Remove duplicates after download
+  -q              Quiet mode (suppress non-error output)
+  -n              Dry run (Skip downloads)
+  -h              Show this help message
+Example: heyedl -d downloads -q 이나경
+EOF
+}
+
+log(){
+    [ "$QUIET" = false ] && echo -e "$1"
+}
+
+# Colors
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+PINK='\033[1;35m'
+PURPLE='\033[1;34m'
+NC='\033[0m'
+
+# Default settings
+ASKSEC=true
+UNIQUE=false
+QUIET=false
+DOWNLOAD=true
+section=""
+
+# Parse options
+while getopts 's:d:uqnh' flag; do
+    case "${flag}" in
+        d) OUTDIR="${OPTARG}" ;;
+        s) ASKSEC=false; section="${OPTARG}" ;;
+        u) UNIQUE=true ;;
+        q) QUIET=true ;;
+        n) DOWNLOAD=false ;;
+        h) help; exit 0 ;;
+        *) help && exit 1 ;;
+    esac
+done
+
+
+shift $((OPTIND-1))
+[ -z "$1" ] && help && exit 1
+
+idol="$1"
+group="$2"
+
+isHangul(){
+    echo "$1" | grep -qP '[\x{AC00}-\x{D7AF}]'
+}
+
+if ! isHangul "$idol"; then
+    if ! command -v hangul > /dev/null 2>&1; then
+        help
+        exit 1
+    fi
+    [ "$QUIET" = false ] && echo "Fetching Hangul for $idol using hangul..."
+    idol=$(hangul "$idol" "$group" | tail -n 1)
+fi
+
+log "\n${PURPLE}Scraping kkzz.kr for:${NC} $idol"
+
+
+# Directories for cache
+idol_dir="/tmp/heye_$idol"
+page1file="$idol_dir/page1"
+allpages="$idol_dir/allpages"
+links="$idol_dir/links.m3u"
+videosLinks="$idol_dir/blog.m3u"
+imgurLinks="$idol_dir/imgur.m3u"
+mkdir -p "$idol_dir"
+
+# Define default output directory
+# Base URL
+base="https://heye.kr/board/index.html"
+
+if [ $ASKSEC = true ]; then
+    log "\n${PINK}sections:${NC} \n1) idol\n2) kgirlsnet\n3) hawk1\n4) uesrup\n"
+    read -p "section: " p
+    case "$p" in
+        1) section="idol";;
+        2) section="kgirlsnet";;
+        3) section="hawk1";;
+        4) section="uesrup";;
+    esac
+fi
+
+log "\n${PURPLE}Scrapping heye.kr${NC} $section ${PURPLE}for:${NC} $idol"
+
+OUTDIR="heyedl/$section"
+LOGFILE="$OUTDIR/$section.m3u"
+mkdir -p "$OUTDIR"
+touch "$LOGFILE"
+
+page1="$base?id=$section&asort=&smode=both&skey=$idol" 
+curl -s "$page1" > "$page1file"
+
+grep -Eio "\?id=$section&asort=&smode=both&skey=$idol&page=[0-9]+" "$page1file" > "$allpages"
+sed -i "s|^|$base|g" "$allpages"
+
+# Calculate total pages found
+total_pages=$(( $(cat "$allpages" | wc -l) + 1 ))
+log "\n${PURPLE}Total pages found:${NC} $total_pages\n" 
+
+getDocs(){
+     page_url="$1"
+     pagenumber=$(echo "$page_url" | awk -F '=' '{print $NF}')
+     temp_file="$idol_dir/page_$pagenumber"
+
+     curl -s "$page_url" | grep -Eoi "&no=[0-9]{3,}" | sort -u > "$temp_file"
+
+     while IFS= read -r line; do
+         echo "$page_url&no=$line" >> "$links"
+     done < "$temp_file"
+ 
+     # the first page is the idol name
+     [ "$(isHangul "$pagenumber")" == "true" ] && pagenumber=1
+     log "${GREEN}Processed page:${NC} $pagenumber"
+}
+
+getDocs "$page1"
+while IFS= read -r page; do
+    getDocs "$page"
+done < "$allpages"
+
+# Calculate total documents links
+total_links=$(wc -l < "$links")
+log "\n${PURPLE}Total documents found:${NC} $total_links\n"
+
+# Process documents for videos URLs
+while IFS= read -r url; do
+    curl -s "$url" | tr -d '\n' | grep -oP '(https://[^"]+\.(mp4|webm))' | sort -u | while read -r link; do
+        if [[ "$link" =~ imgur\.com ]]; then
+            echo "$link" >> "$imgurLinks"
+        else
+            echo "$link" >> "$videosLinks"
+        fi
+    done
+    doc=$(echo "$url" | awk -F '=' '{print $NF}')
+    #log "${GREEN}Processed document:${NC} $doc"
+    sleep 1 # Avoids getting blocked
+done < "$links"
+
+
+# Remove duplicates from imgurLinks and videosLinks
+grep -Fvf "$LOGFILE" "$imgurLinks" > "$imgurLinks.temp" && mv "$imgurLinks.temp" "$imgurLinks"
+grep -Fvf "$LOGFILE" "$videosLinks" > "$videosLinks.temp" && mv "$videosLinks.temp" "$videosLinks"
+
+# Rebuild the playlist
+cat "$imgurLinks" | sort -u >> "$LOGFILE"
+cat "$videosLinks" | sort -u >> "$LOGFILE"
+
+log "\n${PURPLE}Starting download...${NC}\n"
+
+if [ $DOWNLOAD = true ]; then 
+    download_cmd="aria2c -c -d $OUTDIR"
+    if [ "$QUIET" = true ]; then
+        $download_cmd -i "$imgurLinks" -j 16 -x 16 -s 16 --auto-file-renaming=false > /dev/null 2>&1 &
+        $download_cmd -i "$videosLinks" -j 1 -x 1 -s 1 > /dev/null 2>&1
+    else
+        $download_cmd -i "$imgurLinks" -j 16 -x 16 -s 16 --auto-file-renaming=false &
+        $download_cmd -i "$videosLinks" -j 1 -x 1 -s 1
+    fi
+else 
+    log "${GREEN}Download urls cached in${NF} $LOGFILE"
+fi
+
+[ "$UNIQUE" == "true" ] && fdupes -rdN "$OUTDIR" && log "\n${GREEN}Duplicates removed!${NC}\n"
+
+# Cleaning cache files
+rm -rf "$idol_dir"
+# Calculate elapsed time
+log "${GREEN}Elapsed:${NC} $((SECONDS/60))m $((SECONDS%60))s"

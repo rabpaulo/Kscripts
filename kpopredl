@@ -1,0 +1,17 @@
+#!/bin/sh
+
+[ "$1" = "" ] && thread="$(xclip -selection clipboard -o)" || thread="$1"
+
+threadnumber=$(echo "$thread" | cut -d/ -f5)
+printf "Thread: $threadnumber\n"
+
+downdir="${XDG_PICTURES_DIR:-$HOME/hd3tb/Archive}/Kpopre/$threadnumber/"
+[ ! -d "$downdir" ] && mkdir -p "$downdir"
+
+printf "Caching urls...\n"
+cachefile="/tmp/kpopredl$threadnumber"
+
+curl -s "$thread" | grep -oiP "https://up\.kpop\.re/src/\K[^/]+/[^/]+\.(jpg|png|mp4|webm)" > $cachefile
+sed -i 's/^/https:\/\/up.kpop.re\/src\//g' $cachefile
+
+aria2c -c -j 16 -x 16 -s 16 -k 1M --allow-overwrite=false -d "$downdir" -i $cachefile

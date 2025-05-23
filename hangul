@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# This script is used for getting a hangul name (Korean Alphabet) of an idol
+# The links are scraped from kpop.fandom.com/wiki
+# Usage: 
+# ./hangul <idol> <group>
+# Note that some idols don't require a group, like all Fromis_9 members (Except Park Jiwon)
+# Examples:
+# ./hangul Jisoo Blackpink
+# ./hangul "Lee Nagyung"
+
+# Usage function
+help() {
+    echo "Usage: hangul [-c] <Idol> [Group]"
+    echo "Options:"
+    echo "  -c  Copy result to clipboard"
+}
+
+CLIPBOARD=false
+while getopts 'c' flag; do
+    case "${flag}" in
+        c) CLIPBOARD=true ;;
+        *) help && exit 1 ;;
+    esac
+done
+shift $((OPTIND-1))
+
+# Check if arguments are provided
+[ -z "$1" ] && help && exit 1
+
+export base='https://kpop.fandom.com/wiki'
+export cache='/tmp/hangul'
+export idol=$(echo "$1" | sed "s/\b\(.\)/\u\1/g" | sed 's/ /_/g')
+
+# no group provided
+fetch_hangul_idol() {
+    url="${base}/${idol}"
+    curl -s "$url" > "$cache"
+    grep -oP '[\x{AC00}-\x{D7AF}]+' "$cache" | head -n1
+}
+
+# Fetch Hangul for idol in group context
+fetch_hangul_group() {
+    local group_format="$1"
+    url="${base}/${idol}_(${group_format})"
+    curl -s "$url" > "$cache"
+    grep -oP '[\x{AC00}-\x{D7AF}]+' "$cache" | head -n1
+}
+
+if [ -z "$2" ]; then
+    echo "Searching for Hangul: ${idol}..."
+    hangul=$(fetch_hangul_idol)
+else
+    # Try with different group name formats
+    group_formats=(
+        "$(echo "${2^^}" | sed 's/ /_/g')"              # UPPERCASE
+        "$(echo "$2" | sed "s/\b\(.\)/\u\1/g" | sed 's/ /_/g')" # Camel_Case
+        "$(echo "${2,,}" | sed 's/ /_/g')"              # lowercase
+    )
+    
+    for format in "${group_formats[@]}"; do
+        echo "Searching for Hangul: ${idol} (${format})..."
+        hangul=$(fetch_hangul_group "$format")
+        [ -n "$hangul" ] && break
+    done
+fi
+
+if [ -n "$hangul" ]; then
+    if [ "$CLIPBOARD" = true ]; then
+        echo "$hangul" | xclip -sel clipboard
+    else
+        echo "$hangul"
+    fi
+else
+    echo "No Hangul found for ${idol}${2:+ (${2})}"
+    exit 1
+fi
+
+# Clean up temporary cache file
+rm -f "$cache"

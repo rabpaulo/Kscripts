@@ -1,0 +1,148 @@
+#!/bin/sh
+
+help() {
+    echo -e "Usage: kkzzdl [options] <idol name> [group name]"
+    echo -e "\nOptions:"
+    echo -e "  -l <number>     Number of pages to scrape (default: 15)"
+    echo -e "  -d <directory>  Set output directory (default: kkzzdl)"
+    echo -e "  -q              Quiet mode (suppress non-error output)"
+    echo -e "  -n              Dry run (Skip downloads)"
+    echo -e "  -h              Show this help message"
+    echo -e "\nExample: kkzzdl -d downloads -q 이나경"
+}
+
+log(){
+    [ "$QUIET" = false ] && echo -e "$1"
+}
+
+# Colors
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+PURPLE='\033[1;34m'
+NC='\033[0m'
+
+# Default settings
+OUTDIR="kkzzdl"
+LOGFILE="$OUTDIR/kkzzdl.m3u"
+UNIQUE=false
+PAGES=15
+QUIET=false
+DOWNLOAD=true
+
+# Parse options
+while getopts 'd:l:unqh' flag; do
+    case "${flag}" in
+        d) OUTDIR="${OPTARG}" ;;
+        l) PAGES="${OPTARG}" ;;
+        u) UNIQUE=true ;;
+        q) QUIET=true ;;
+        n) DOWNLOAD=false ;;
+        h) help; exit 0 ;;
+        *) help && exit 1 ;;
+    esac
+done
+
+mkdir -p "$OUTDIR"
+touch "$LOGFILE"
+
+shift $((OPTIND-1))
+[ -z "$1" ] && help && exit 1
+
+idol="$1"
+group="$2"
+
+isHangul(){
+    echo "$1" | grep -qP '[\x{AC00}-\x{D7AF}]'
+}
+
+if ! isHangul "$idol"; then
+    if ! command -v hangul > /dev/null 2>&1; then
+        help
+        exit 1
+    fi
+    log "Fetching Hangul for $idol using hangul..."
+    idol=$(hangul "$idol" "$group" | tail -n 1)
+fi
+
+log "\n${PURPLE}Scrapping kkzz.kr for:${NC} $idol"
+
+# Directories for cache
+idol_dir="/tmp/kkzzdl"
+mkdir -p "$idol_dir"
+links="$idol_dir/links.m3u"
+videosLinks="$idol_dir/blog.m3u"
+imgurLinks="$idol_dir/imgur.m3u"
+
+# Process pages to extract docs links
+getDocs() {
+    page_url="$1"
+    pagenumber=$(echo "$page_url" | awk -F '=' '{print $NF}')
+    temp_file="$idol_dir/page$pagenumber"
+    url="https://kkzz.kr/?board_name=board1&search_field=fn_title&search_text=$idol&"
+    
+    # Extrair links e prefixa URL
+    curl -s "$page_url" | grep -iEo "vid=[0-9]+" | sort -u > "$temp_file"
+    
+    # Break if no results found
+    [ ! -s "$temp_file" ] && return 1
+
+    while IFS= read -r line; do
+        echo "${url}&$line" >> "$links"
+    done < "$temp_file"
+   
+    # the first page is the idol name
+    [ "$(isHangul "$pagenumber")" == "true" ] && pagenumber=1
+    log "${GREEN}Processed page:${NC} $pagenumber"
+}
+
+for page in $(seq 1 "$PAGES"); do 
+    base="https://kkzz.kr/?mode=list&board_name=board1&category1=&search_field=fn_title&search_text=$idol&board_page=$page"
+
+    if ! getDocs "$base"; then
+        break
+    fi
+    sleep 1
+done
+
+# Calculate total documents links
+total_links=$(wc -l < "$links")
+log "\n${PURPLE}Total documents found:${NC} $total_links\n"
+
+# Process documents for videos URLs
+while IFS= read -r url; do
+    curl -s "$url" | grep -iEo "https.*\.mp4" | sort -u | while read -r link; do
+        if [[ "$link" =~ imgur\.com ]]; then
+            echo "$link" >> "$imgurLinks"
+        else
+            echo "$link" >> "$videosLinks"
+        fi
+    done
+    doc=$(echo "$url" | cut -d = -f 5)
+    log "${GREEN}Processed document:${NC} $doc"
+    sleep 1 # Avoids getting blocked
+done < "$links"
+
+
+# Remove duplicates from imgurLinks and videosLinks
+grep -Fvf "$LOGFILE" "$imgurLinks" > "$imgurLinks.temp" && mv "$imgurLinks.temp" "$imgurLinks"
+grep -Fvf "$LOGFILE" "$videosLinks" > "$videosLinks.temp" && mv "$videosLinks.temp" "$videosLinks"
+# Rebuild the playlist
+cat "$imgurLinks" "$videosLinks" | sort -u >> "$LOGFILE"
+
+log "\n${PURPLE}Starting download...${NC}\n"
+if [ $DOWNLOAD = true ]; then 
+    download_cmd="aria2c -c -d $OUTDIR"
+    if [ "$QUIET" = true ]; then
+        $download_cmd -i "$imgurLinks" -j 16 -x 16 -s 16 --auto-file-renaming=false > /dev/null 2>&1 &
+        $download_cmd -i "$videosLinks" -j 1 -x 1 -s 1 > /dev/null 2>&1
+    else
+        $download_cmd -i "$imgurLinks" -j 16 -x 16 -s 16 --auto-file-renaming=false &
+        $download_cmd -i "$videosLinks" -j 1 -x 1 -s 1
+    fi
+else 
+    log "Download urls cached in $LOGFILE"
+fi
+
+rm -rf "$idol_dir"
+log "${GREEN}Elapsed:${NC} $((SECONDS/60))m $((SECONDS%60))s"
